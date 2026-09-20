@@ -1,0 +1,27 @@
+# Python cache and environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv
+env/
+venv/
+
+# Reports and Documentation (Báo cáo đồ án)
+BAO_CAO_*
+BaoCao*
+*.docx
+*.pdf
+debug_*.png
+temp_*
+streamlit_log.txt
+pdf_previews/
+
+# Presentation, Slides and Media (Slide thuyết trình)
+SLIDE_*
+presentation/
+scratch/
+run_slide.bat
+KICH_BAN_*
+images/
