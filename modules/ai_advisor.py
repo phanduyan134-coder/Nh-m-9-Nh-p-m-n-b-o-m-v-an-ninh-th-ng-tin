@@ -61,28 +61,52 @@ def get_available_models(api_key: str) -> list:
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     params = {"key": api_key} if api_key.startswith("AIza") else None
 
-    # Thử lấy qua official SDK client.models.list()
+    EXCLUDED_KEYWORDS = ["tts", "embed", "imagen", "audio", "realtime", "robotics", "vision-preview"]
+
+    def _is_valid_text_model(name: str, methods: list = None, output_modalities: list = None) -> bool:
+        n = name.lower()
+        if any(bad in n for bad in EXCLUDED_KEYWORDS):
+            return False
+        if "gemini" not in n:
+            return False
+        if methods and "generateContent" not in methods:
+            return False
+        if output_modalities and "TEXT" not in output_modalities:
+            return False
+        return True
+
+    def _sort_key(name: str):
+        n = name.lower()
+        is_flash = 0 if "flash" in n else 1
+        is_preview = 1 if ("preview" in n or "exp" in n) else 0
+        if "2.0" in n:
+            ver = 0
+        elif "1.5" in n:
+            ver = 1
+        elif "2.5" in n:
+            ver = 2
+        else:
+            ver = 3
+        return (is_flash, is_preview, ver)
+
+    # 1. Thử lấy qua official SDK client.models.list()
     try:
         from google import genai
         client = genai.Client(api_key=api_key)
         sdk_models = []
         for m in client.models.list():
             name = getattr(m, "name", "")
+            clean_name = name.replace("models/", "")
             actions = getattr(m, "supported_actions", []) or getattr(m, "supported_generation_methods", [])
-            if not actions or "generateContent" in actions:
-                sdk_models.append(name.replace("models/", ""))
+            output_mods = getattr(m, "output_modalities", None) or getattr(m, "supported_output_modalities", None)
+            if _is_valid_text_model(clean_name, actions, output_mods):
+                sdk_models.append(clean_name)
         if sdk_models:
-            return sorted(
-                sdk_models,
-                key=lambda x: (
-                    0 if "flash" in x.lower() else 1,
-                    0 if "2" in x else (1 if "1.5" in x else 2),
-                ),
-            )
+            return sorted(list(set(sdk_models)), key=_sort_key)
     except Exception:
         pass
 
-    # Fallback qua HTTP GET ListModels
+    # 2. Fallback qua HTTP GET ListModels
     for ver in ["v1beta", "v1"]:
         try:
             url = f"https://generativelanguage.googleapis.com/{ver}/models"
@@ -91,18 +115,13 @@ def get_available_models(api_key: str) -> list:
                 data = res.json()
                 models = []
                 for m in data.get("models", []):
-                    name = m.get("name", "").replace("models/", "")
+                    clean_name = m.get("name", "").replace("models/", "")
                     methods = m.get("supportedGenerationMethods", [])
-                    if not methods or "generateContent" in methods:
-                        models.append(name)
+                    output_mods = m.get("supportedOutputModalities", [])
+                    if _is_valid_text_model(clean_name, methods, output_mods):
+                        models.append(clean_name)
                 if models:
-                    return sorted(
-                        models,
-                        key=lambda x: (
-                            0 if "flash" in x.lower() else 1,
-                            0 if "2" in x else (1 if "1.5" in x else 2),
-                        ),
-                    )
+                    return sorted(list(set(models)), key=_sort_key)
         except Exception:
             pass
 
@@ -121,10 +140,15 @@ def call_gemini_advisor(score_result: dict, api_key: str, timeout: int = 20) -> 
     metadata = build_privacy_safe_metadata(score_result)
     prompt = _build_prompt(metadata)
 
-    # 1. Tự động lấy danh sách model mà Google cấp cho tài khoản này
+    # 1. Tự động lấy danh sách model văn bản khả dụng mà Google cấp cho tài khoản này
     models_to_try = get_available_models(clean_key)
 
-    # 2. Thử gọi qua official google-genai SDK
+    # Luôn bảo đảm có danh sách dự phòng các model text phổ biến nhất
+    for fallback_m in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-pro"]:
+        if fallback_m not in models_to_try:
+            models_to_try.append(fallback_m)
+
+    # 2. Thử gọi qua official google-genai SDK nếu có
     try:
         from google import genai
         client = genai.Client(api_key=clean_key)
@@ -139,10 +163,12 @@ def call_gemini_advisor(score_result: dict, api_key: str, timeout: int = 20) -> 
                     return {"success": False, "text": None, "error": "Lỗi xác thực (401): API key không hợp lệ hoặc tài khoản chưa kích hoạt Generative Language API."}
                 if "403" in err_str or "PERMISSION_DENIED" in err_str:
                     return {"success": False, "text": None, "error": "Lỗi quyền truy cập (403): Key bị giới hạn hoặc chưa bật Generative Language API trong Project."}
+                # Nếu gặp lỗi 400 (model không hỗ trợ) hoặc lỗi khác -> tiếp tục thử model tiếp theo
+                continue
     except Exception:
         pass
 
-    # 3. Fallback sang HTTP requests
+    # 3. Fallback sang HTTP requests trực tiếp
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
     }
@@ -167,22 +193,27 @@ def call_gemini_advisor(score_result: dict, api_key: str, timeout: int = 20) -> 
                 )
                 if response.status_code == 200:
                     data = response.json()
-                    text = data["candidates"][0]["content"]["parts"][0]["text"]
-                    return {"success": True, "text": text, "error": None}
-                elif response.status_code == 404:
-                    err_msg = ""
-                    try:
-                        err_msg = response.json().get("error", {}).get("message", "")
-                    except Exception:
-                        err_msg = response.text[:120]
-                    last_error = f"Model {model} ({api_ver}) trả về 404: {err_msg}" if err_msg else f"Model {model} không tìm thấy (404)."
-                    continue
-                elif response.status_code in (400, 401, 403):
+                    candidates = data.get("candidates", [])
+                    if candidates and "content" in candidates[0]:
+                        parts = candidates[0]["content"].get("parts", [])
+                        if parts and "text" in parts[0]:
+                            return {"success": True, "text": parts[0]["text"], "error": None}
+                elif response.status_code in (401, 403):
                     err_data = response.json().get("error", {})
                     msg = err_data.get("message", "API key không hợp lệ hoặc chưa được cấp quyền.")
                     return {"success": False, "text": None, "error": f"Lỗi xác thực ({response.status_code}): {msg}"}
+                elif response.status_code == 404:
+                    continue
+                elif response.status_code == 400:
+                    err_data = response.json().get("error", {})
+                    msg = err_data.get("message", "")
+                    last_error = f"Model {model} ({api_ver}) không tương thích (400: {msg})"
+                    continue
+                elif response.status_code == 429:
+                    last_error = f"Model {model} ({api_ver}) bị giới hạn quota (429)."
+                    continue
                 else:
-                    last_error = f"Lỗi máy chủ Google ({response.status_code}): {response.text[:150]}"
+                    last_error = f"Lỗi máy chủ Google ({response.status_code}): {response.text[:120]}"
             except requests.exceptions.RequestException as e:
                 last_error = f"Lỗi kết nối mạng: {e}"
             except (KeyError, IndexError, json.JSONDecodeError) as e:
